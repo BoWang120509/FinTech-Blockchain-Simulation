@@ -1,0 +1,164 @@
+**********Solidity实现环节**********
+我这里不赘述具体的实现目的和结果了，我写在了代码里。这里我只说使用步骤：
+1. compile下面的代码。
+
+2. 成功后在deploy里面选择"fundtoken“这个contract；InitialSupply我选的是1000个token,就输入”1000000000000000000000“；然后点击deploy，你会在下方得到一个"fundtoken"的合约。
+
+3. 切换contract到”fundICO“，在deploy下你会看到三个输入框，第一个输入刚刚的"fundtoken合约”的地址；第二个输入你希望ICO持续的时间，基本2-4分钟足够；第三个输入募资上限，单位是ETH，通常你需要N个投资者就输入N个ETH作为上限，方便调试。然后点击deploy，你会在下方得到一个"fundICO“的合约。
+
+4. 必须手动给ICO转入token，如果是N个投资者则至少需要N个token，也就是Ne18wei才能让投资者每人领取1token。因此先打开下方"fundtoken合约"，找到transfer()，你会看到两个输入框，第一个输入"fundICO合约”的地址；第二个输入框输入对应投资者数量的token数。举例，三个投资者，输入3000000000000000000。可以用"fundtoken合约“中的Balanceof()输入"fundICO合约”的地址来检查是否成功。
+
+5. 选择N个投资者进行投资，具体操作就是在account上面进行切换。第一个账户是"fundowner"，此后加入的账户是投资者。重复以下步骤至全部投资者操作完毕：切换账户；在value输入1ETH(对应数量的wei也可以)；在"fundICO合约"中找到contribute，点击即可。
+
+6. 完成上述步骤代表投资者向基金发起人完成了投资，接下来要等待你之前设定好的ICO持续时间的结束。
+
+7. 针对N个投资者：切换账户；在下方"fundICO合约“中找到claimTokens()，点击；使用"fundtoken合约"中balanceof()，输入对应账户的地址，检查token是否到手。
+
+8. 完成全部投资者token转移之后在账户中选择"fundowner"账户地址，通常是第一个账户；在下方"fundICO合约“中找到finalizeSuccess()，点击。
+
+9. 成功后，finalized = true，ICO全部ETH进入fundowner，contribution变成0，合约结束。
+可用检查：
+fundowner余额增加
+ICO余额等于0
+Finalized = true
+
+
++++++++++++++++++++++++++++++++++++++代码部分++++++++++++++++++++++++++++++++++++++
+
+/*
+// ============================================================
+//   MF740 Project Version — ERC20 + Mini ICO (Original Design)
+//   特点：
+//   - 引入了募资上限，退款机制，成功条件，锁仓。
+//   - 展示项目的“金融产品发行系统”。
+//   如果说python部分是模拟区块链的核心逻辑，在这里就是真正的区块链执行逻辑。HW有过简单的接触。
+//   结合python部分，两个层面都在对应现实中的setback。例如Token分发透明性，项目方作恶风险，各类系统风险。
+// ============================================================
+*/
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+// ======================= ERC20 代币 ===========================
+// 任何web3产品都需要一个token作为权益单位，类比的话就如同基金份额或者股权凭证。
+// 所以这个部分就是给项目预铸supply，类似于股票发行。后面接入ICO的奖励和分配凭证。
+// 对应的是我python部分的余额模型。
+// 在python里，账户余额是dict。转账，PoW，LCR2等都是模拟逻辑层。
+// 在这里余额是在链上，转账真实发生，账本是无法篡改的状态树。
+contract FundToken {
+    string public name = "MF740FundToken";
+    string public symbol = "MF740FT";
+    uint8 public decimals = 18;
+
+    uint256 public totalSupply;
+    address public owner;
+
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    constructor(uint256 initialSupply) {
+        owner = msg.sender;
+        totalSupply = initialSupply;
+        balanceOf[owner] = initialSupply;
+    }
+
+    // 主体转账功能
+    function transfer(address to, uint256 amount) public returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "Insufficient balance");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    // approve
+    function approve(address spender, uint256 amount) public returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    // transferFrom
+    function transferFrom(address from, address to, uint256 amount)
+        public
+        returns (bool)
+    {
+        require(balanceOf[from] >= amount, "Insufficient balance");
+        require(allowance[from][msg.sender] >= amount, "Not approved");
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
+
+// ======================= Mini ICO 合约 ===========================
+// 这里呢就是一个简化的募资系统。支持投资，自动记录贡献，到期后发token，成功就项目方提币，失败可以退款。
+// 这是上线金融产品的重要一环。对应到现实中的代币发行机制就比如Curve,MakerDAO之类，属于任何web3项目融资的基础设施。
+contract FundICO {
+    FundToken public token; // 代币地址
+    address public fundOwner; // 项目方，募资成功后收 ETH
+    uint256 public tokenPrice = 1e15; // 一枚 Token 的价格。*******对应的是wei*******
+    uint256 public hardcap = 500 ether; // 募资上限，自己调整
+    uint256 public deadline; // 截止时间
+
+    uint256 public totalRaised; // 当前募资金额
+    bool public finalized = false; // 是否已经结束
+
+    mapping(address => uint256) public contributions;
+
+    constructor(address tokenAddress, uint256 durationMinutes, uint256 hardcapInEth) {
+        token = FundToken(tokenAddress);
+        fundOwner = msg.sender;
+
+        hardcap = hardcapInEth * 1 ether;
+        deadline = block.timestamp + durationMinutes * 1 minutes;
+    }
+
+
+    // === 投资入口 ===
+    function contribute() external payable {
+        require(block.timestamp < deadline, "ICO ended");
+        require(totalRaised + msg.value <= hardcap, "Exceeds hardcap");
+
+        contributions[msg.sender] += msg.value;
+        totalRaised += msg.value;
+    }
+
+    // === 投资者领取Token ===
+    function claimTokens() external {
+        require(block.timestamp >= deadline, "ICO not finished");
+        require(!finalized, "Already finalized");
+
+        uint256 contributeAmt = contributions[msg.sender];
+        require(contributeAmt > 0, "No contribution");
+
+        uint256 tokensToGive = contributeAmt / tokenPrice;
+        contributions[msg.sender] = 0;
+
+        require(
+            token.transfer(msg.sender, tokensToGive),
+            "Token transfer failed"
+        );
+    }
+
+    // === 募资成功：项目方领取ETH ===
+    function finalizeSuccess() external {
+        require(block.timestamp >= deadline, "Not finished");
+        require(!finalized, "Already finalized");
+        require(totalRaised >= hardcap, "Goal not reached");
+
+        finalized = true;
+        payable(fundOwner).transfer(address(this).balance);
+    }
+
+    // === 募资失败：退款 ===
+    function refund() external {
+        require(block.timestamp >= deadline, "Not finished");
+        require(totalRaised < hardcap, "Goal reached, refund unavailable");
+
+        uint256 amount = contributions[msg.sender];
+        require(amount > 0, "Nothing to refund");
+
+        contributions[msg.sender] = 0;
+        payable(msg.sender).transfer(amount);
+    }
+}
